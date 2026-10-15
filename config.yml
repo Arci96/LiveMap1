@@ -1,0 +1,13 @@
+# Port des Webservers (in der Firewall/Router freigeben, wenn von aussen erreichbar)
+port: 8123
+# 0.0.0.0 = von ueberall erreichbar, 127.0.0.1 = nur lokal
+bind-address: "0.0.0.0"
+# Zugangs-Token. Leer lassen = wird beim ersten Start automatisch erzeugt.
+token: ""
+
+# Wie oft (Sekunden) die Umgebung der Spieler im Kartenspeicher aktualisiert wird. 0 = aus
+live-refresh-seconds: 10
+# Wie viele Regionen (je ca. 1 MB) gleichzeitig im RAM gehalten werden
+max-cached-regions: 32
+# Geschwindigkeit von /livemap fullrender (Chunks pro Tick). Bei Lag verkleinern.
+fullrender-chunks-per-tick: 3

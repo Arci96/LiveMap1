@@ -1,0 +1,14 @@
+name: LiveMap
+version: 1.0.0
+main: de.livemap.LiveMapPlugin
+api-version: '1.21'
+description: Live-Karte mit Spielern, Mobs und Block-Ereignissen
+commands:
+  livemap:
+    description: Zeigt die URL der Live-Karte
+    usage: /livemap [fullrender [welt] [force|stop] | status]
+    permission: livemap.use
+permissions:
+  livemap.use:
+    description: Darf die Karten-URL abrufen
+    default: op
