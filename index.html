@@ -1,0 +1,795 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LiveMap</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;font:13px system-ui,sans-serif;background:#111;color:#ddd;overflow:hidden}
+#main{flex:1;position:relative;min-width:0}
+canvas{width:100%;height:100%;display:block;cursor:grab;background:#1a1a1a;touch-action:none}
+#bar{position:absolute;top:8px;left:8px;right:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:#000a;padding:6px 10px;border-radius:8px}
+#status{position:absolute;bottom:8px;left:8px;background:#000a;padding:4px 10px;border-radius:8px;font-family:monospace}
+#side{width:300px;background:#181818;border-left:1px solid #333;display:flex;flex-direction:column}
+#side h3{margin:0;padding:8px 10px;background:#222;font-size:12px;text-transform:uppercase;letter-spacing:.05em}
+#players{max-height:35%;overflow:auto}
+#log{flex:1;overflow:auto}
+.row{padding:5px 10px;border-bottom:1px solid #262626;cursor:pointer}
+.row:hover{background:#252525}
+.row small{color:#999;display:block}
+.place{color:#6fdc6f}.break{color:#ff6b6b}.explode{color:#ffb347}
+button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:3px 8px;cursor:pointer}
+button:hover{background:#444}
+#gl,#ov{position:absolute;inset:0;display:none;background:none}
+#ov{pointer-events:none}
+@media(max-width:700px){#side{display:none}}
+</style>
+</head>
+<body>
+<div id="main">
+  <canvas id="map"></canvas><canvas id="gl"></canvas><canvas id="ov"></canvas>
+  <div id="bar">
+    <span>Welt <select id="worldSel"></select></span>
+    <label><input type="checkbox" id="tPl" checked> Spieler</label>
+    <label><input type="checkbox" id="tHo" checked> feindliche Mobs</label>
+    <label><input type="checkbox" id="tPa" checked> friedliche Mobs</label>
+    <label><input type="checkbox" id="tGrid"> Chunk-Gitter</label>
+    <button id="b3d">3D-Ansicht</button>
+    <span id="o3" style="display:none">Sichtweite <select id="r3"><option value="4">nah</option><option value="6" selected>mittel</option><option value="8">weit</option><option value="12">sehr weit</option></select></span>
+    <span id="info"></span>
+  </div>
+  <div id="status">Verbinde…</div>
+</div>
+<div id="side">
+  <h3>Spieler</h3><div id="players"></div>
+  <h3>Block-Ereignisse</h3><div id="log"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const cv = $('map'), ctx = cv.getContext('2d');
+
+let view = {x: 0, z: 0, s: 4};
+let world = null, state = null, follow = null, lastEv = 0, first = true;
+let dragging = false, mouse = null, fetching = false;
+const tiles = new Map(), regTiles = new Map(), tried = new Map(), flashes = [], logs = [], playerRows = new Map();
+const key = (w, cx, cz) => w + '|' + cx + '|' + cz;
+
+async function api(path) {
+  const r = await fetch(path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN));
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// ---------- Kacheln ----------
+function makeTile(d) {
+  const c = document.createElement('canvas');
+  c.width = c.height = 16;
+  const g = c.getContext('2d'), im = g.createImageData(16, 16);
+  for (let i = 0; i < 256; i++) {
+    const v = d[i];
+    if (v < 0) continue;
+    im.data[i * 4] = (v >> 16) & 255;
+    im.data[i * 4 + 1] = (v >> 8) & 255;
+    im.data[i * 4 + 2] = v & 255;
+    im.data[i * 4 + 3] = 255;
+  }
+  g.putImageData(im, 0, 0);
+  return c;
+}
+
+function markDirty(w, x, z, r) {
+  const cx0 = Math.floor(x / 16), cz0 = Math.floor(z / 16);
+  for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
+    const k = key(w, cx0 + dx, cz0 + dz), t = tiles.get(k);
+    const dd = cd.get(k); if (dd) dd.dirty = true;
+    if (t) t.dirty = true; else tried.delete(k);
+  }
+}
+
+const chunkMode = () => view.s >= 3;
+const lodF = () => view.s >= 1 ? 2 : view.s >= 0.5 ? 4 : view.s >= 0.25 ? 8 : view.s >= 0.12 ? 16 : 32;
+
+async function fetchTiles() {
+  if (!world || fetching) return;
+  fetching = true;
+  try { if (chunkMode()) await fetchChunks(); else await fetchRegions(); } catch (e) { /* naechster Versuch */ }
+  fetching = false;
+}
+
+// Nah herangezoomt: einzelne Chunks (live oder aus dem Speicher)
+async function fetchChunks() {
+  const W = cv.width, H = cv.height, now = Date.now(), wname = world;
+  const mx = Math.floor(view.x / 16), mz = Math.floor(view.z / 16);
+  const c0x = Math.max(Math.floor((view.x - W / 2 / view.s) / 16), mx - 12);
+  const c1x = Math.min(Math.floor((view.x + W / 2 / view.s) / 16), mx + 12);
+  const c0z = Math.max(Math.floor((view.z - H / 2 / view.s) / 16), mz - 12);
+  const c1z = Math.min(Math.floor((view.z + H / 2 / view.s) / 16), mz + 12);
+  const pls = (state?.players || []).filter(p => p.w === wname);
+  const near = (cx, cz) => pls.some(p => Math.abs(Math.floor(p.x / 16) - cx) <= 3 && Math.abs(Math.floor(p.z / 16) - cz) <= 3);
+
+  const groups = new Map();
+  for (let cx = c0x; cx <= c1x; cx++) for (let cz = c0z; cz <= c1z; cz++) {
+    const k = key(wname, cx, cz), t = tiles.get(k);
+    const need = t ? (t.dirty || now - t.t > (t.live ? 30000 : 60000) || (now - t.t > 3000 && near(cx, cz)))
+                   : (now - (tried.get(k) || 0) > 10000);
+    if (!need) continue;
+    const gk = Math.floor(cx / 8) + ',' + Math.floor(cz / 8);
+    if (!groups.has(gk)) groups.set(gk, [Math.floor(cx / 8) * 8, Math.floor(cz / 8) * 8]);
+  }
+
+  for (const [gx, gz] of [...groups.values()].slice(0, 4)) {
+    const r = await api(`/api/chunks?world=${encodeURIComponent(wname)}&x0=${gx}&z0=${gz}&x1=${gx + 7}&z1=${gz + 7}`);
+    const got = new Set();
+    for (const c of r.chunks) {
+      const k = key(wname, c.x, c.z);
+      got.add(k);
+      tiles.set(k, {w: wname, cx: c.x, cz: c.z, c: makeTile(c.d), t: Date.now(), dirty: false, live: c.l === 1});
+    }
+    for (let cx = gx; cx < gx + 8; cx++) for (let cz = gz; cz < gz + 8; cz++) {
+      const k = key(wname, cx, cz);
+      tried.set(k, Date.now());
+      const t = tiles.get(k);
+      if (t && !got.has(k)) t.dirty = false;
+    }
+  }
+}
+
+// Weit herausgezoomt: verkleinerte Regionen (je 512x512 Bloecke)
+async function fetchRegions() {
+  const W = cv.width, H = cv.height, now = Date.now(), wname = world, f = lodF();
+  const r0x = Math.floor((view.x - W / 2 / view.s) / 512), r1x = Math.floor((view.x + W / 2 / view.s) / 512);
+  const r0z = Math.floor((view.z - H / 2 / view.s) / 512), r1z = Math.floor((view.z + H / 2 / view.s) / 512);
+  const jobs = [];
+  for (let rx = r0x; rx <= r1x; rx++) for (let rz = r0z; rz <= r1z; rz++) {
+    const k = wname + '|r' + f + '|' + rx + '|' + rz, t = regTiles.get(k);
+    const age = now - (t ? t.t : (tried.get(k) || 0));
+    if (age > (t ? 15000 : 10000)) jobs.push({k, rx, rz});
+  }
+  for (const j of jobs.slice(0, 4)) {
+    const r = await fetch(`/api/region?world=${encodeURIComponent(wname)}&rx=${j.rx}&rz=${j.rz}&f=${f}&token=${encodeURIComponent(TOKEN)}`);
+    tried.set(j.k, Date.now());
+    if (r.status === 200) {
+      const n = 512 / f, buf = new Uint8ClampedArray(await r.arrayBuffer());
+      const c = document.createElement('canvas'); c.width = c.height = n;
+      c.getContext('2d').putImageData(new ImageData(buf, n, n), 0, 0);
+      regTiles.set(j.k, {w: wname, f, rx: j.rx, rz: j.rz, c, t: Date.now()});
+    } else if (r.status === 204) regTiles.delete(j.k);
+  }
+  if (regTiles.size > 150) {
+    const old = [...regTiles.entries()].sort((a, b) => a[1].t - b[1].t).slice(0, regTiles.size - 150);
+    for (const [k] of old) regTiles.delete(k);
+  }
+}
+
+// ---------- Zeichnen ----------
+const hostile = '#ff4d4d', passive = '#6fdc6f';
+function draw() {
+  if (mode3d) { draw3d(); requestAnimationFrame(draw); return; }
+  if (cv.width !== cv.clientWidth) cv.width = cv.clientWidth;
+  if (cv.height !== cv.clientHeight) cv.height = cv.clientHeight;
+  const W = cv.width, H = cv.height, s = view.s;
+  const tx = x => (x - view.x) * s + W / 2, tz = z => (z - view.z) * s + H / 2;
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, W, H);
+
+  if (world && state) {
+    const lf = lodF();
+    const regs = [...regTiles.values()].filter(t => t.w === world && t.f >= lf).sort((a, b) => b.f - a.f);
+    for (const t of regs) {
+      const x = tx(t.rx * 512), z = tz(t.rz * 512), sz = 512 * s;
+      if (x > W || z > H || x + sz < 0 || z + sz < 0) continue;
+      ctx.drawImage(t.c, x, z, sz + 0.6, sz + 0.6);
+    }
+    if (chunkMode()) for (const t of tiles.values()) {
+      if (t.w !== world) continue;
+      const x = tx(t.cx * 16), z = tz(t.cz * 16);
+      if (x > W || z > H || x + 16 * s < 0 || z + 16 * s < 0) continue;
+      ctx.drawImage(t.c, x, z, 16 * s + 0.6, 16 * s + 0.6);
+    }
+
+    if ($('tGrid').checked && s >= 2) {
+      ctx.strokeStyle = '#ffffff22'; ctx.lineWidth = 1; ctx.beginPath();
+      for (let cx = Math.floor((view.x - W / 2 / s) / 16); cx <= (view.x + W / 2 / s) / 16; cx++) { const x = Math.round(tx(cx * 16)) + .5; ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+      for (let cz = Math.floor((view.z - H / 2 / s) / 16); cz <= (view.z + H / 2 / s) / 16; cz++) { const z = Math.round(tz(cz * 16)) + .5; ctx.moveTo(0, z); ctx.lineTo(W, z); }
+      ctx.stroke();
+    }
+
+    const wd = state.worlds.find(w => w.name === world);
+    if (wd) {
+      ctx.strokeStyle = '#ff3333'; ctx.setLineDash([8, 6]); ctx.lineWidth = 2;
+      ctx.strokeRect(tx(wd.bx - wd.bs / 2), tz(wd.bz - wd.bs / 2), wd.bs * s, wd.bs * s);
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#ffd400'; ctx.beginPath(); ctx.arc(tx(wd.sx), tz(wd.sz), 5, 0, 7); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = '11px sans-serif'; ctx.fillText('Spawn', tx(wd.sx) + 8, tz(wd.sz) + 4);
+    }
+
+    // Block-Ereignisse (Ring-Animation)
+    const now = Date.now();
+    for (let i = flashes.length - 1; i >= 0; i--) {
+      const f = flashes[i], age = now - f.t;
+      if (age > 4000) { flashes.splice(i, 1); continue; }
+      if (f.w !== world) continue;
+      ctx.globalAlpha = 1 - age / 4000;
+      ctx.strokeStyle = f.type === 'place' ? '#6fdc6f' : f.type === 'break' ? '#ff6b6b' : '#ffb347';
+      ctx.lineWidth = 3; ctx.beginPath();
+      ctx.arc(tx(f.x + .5), tz(f.z + .5), 5 + age / 4000 * 30, 0, 7); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // Mobs
+    for (const m of state.mobs) {
+      if (m.w !== world) continue;
+      if (m.h ? !$('tHo').checked : !$('tPa').checked) continue;
+      const x = tx(m.x), z = tz(m.z);
+      if (x < -5 || z < -5 || x > W + 5 || z > H + 5) continue;
+      ctx.fillStyle = m.h ? hostile : passive;
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(x, z, 3.5, 0, 7); ctx.fill(); ctx.stroke();
+      if (s >= 8) { ctx.fillStyle = '#fff'; ctx.font = '10px sans-serif'; ctx.fillText(m.t.toLowerCase(), x + 6, z + 3); }
+    }
+
+    // Spieler
+    if ($('tPl').checked) for (const p of state.players) {
+      if (p.w !== world) continue;
+      const x = tx(p.x), z = tz(p.z), a = (p.yaw + 90) * Math.PI / 180;
+      ctx.strokeStyle = '#4de1ff'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x, z); ctx.lineTo(x + Math.cos(a) * 14, z + Math.sin(a) * 14); ctx.stroke();
+      ctx.fillStyle = '#4de1ff'; ctx.strokeStyle = '#fff';
+      ctx.beginPath(); ctx.arc(x, z, 6, 0, 7); ctx.fill(); ctx.stroke();
+      ctx.font = 'bold 12px sans-serif'; ctx.lineWidth = 3; ctx.strokeStyle = '#000';
+      ctx.strokeText(p.name, x + 10, z + 4); ctx.fillStyle = '#fff'; ctx.fillText(p.name, x + 10, z + 4);
+    }
+  }
+  requestAnimationFrame(draw);
+}
+
+// ---------- Steuerung ----------
+let last = null;
+cv.addEventListener('pointerdown', e => { dragging = true; last = {x: e.clientX, y: e.clientY}; cv.setPointerCapture(e.pointerId); cv.style.cursor = 'grabbing'; });
+cv.addEventListener('pointerup', () => { dragging = false; cv.style.cursor = 'grab'; });
+cv.addEventListener('pointermove', e => {
+  const r = cv.getBoundingClientRect();
+  mouse = {x: e.clientX - r.left, y: e.clientY - r.top};
+  if (dragging) {
+    view.x -= (e.clientX - last.x) / view.s; view.z -= (e.clientY - last.y) / view.s;
+    last = {x: e.clientX, y: e.clientY}; follow = null;
+  }
+  hover();
+});
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), mx = e.clientX - r.left - cv.width / 2, mz = e.clientY - r.top - cv.height / 2;
+  const wx = view.x + mx / view.s, wz = view.z + mz / view.s;
+  view.s = Math.min(32, Math.max(0.06, view.s * Math.exp(-e.deltaY * 0.0015)));
+  view.x = wx - mx / view.s; view.z = wz - mz / view.s;
+}, {passive: false});
+
+function hover() {
+  if (!mouse || !state) return;
+  const wx = view.x + (mouse.x - cv.width / 2) / view.s, wz = view.z + (mouse.y - cv.height / 2) / view.s;
+  let txt = `X ${Math.floor(wx)}  Z ${Math.floor(wz)}`, best = null, bd = 12;
+  const cands = [...state.players.map(p => ({...p, label: p.name})), ...state.mobs.map(m => ({...m, label: m.t.toLowerCase()}))];
+  for (const c of cands) {
+    if (c.w !== world) continue;
+    const d = Math.hypot((c.x - wx) * view.s, (c.z - wz) * view.s);
+    if (d < bd) { bd = d; best = c; }
+  }
+  if (best) txt += `  |  ${best.label} (Y ${Math.round(best.y)})`;
+  $('status').textContent = txt;
+}
+
+$('worldSel').onchange = e => { world = e.target.value; follow = null; };
+
+// ---------- Listen ----------
+function renderPlayers() {
+  const box = $('players'), names = new Set(state.players.map(p => p.name));
+  for (const [n, row] of playerRows) if (!names.has(n)) { row.remove(); playerRows.delete(n); }
+  for (const p of state.players) {
+    let row = playerRows.get(p.name);
+    if (!row) {
+      row = el('div', 'row'); row.append(el('b'), el('small'));
+      row.onclick = () => { follow = p.name; const q = state.players.find(x => x.name === p.name); if (q) { world = q.w; $('worldSel').value = world; view.x = q.x; view.z = q.z; } };
+      box.append(row); playerRows.set(p.name, row);
+    }
+    row.children[0].textContent = (follow === p.name ? '👁 ' : '') + p.name;
+    row.children[1].textContent = `${p.w} · ${Math.round(p.x)} / ${Math.round(p.y)} / ${Math.round(p.z)} · ❤ ${Math.round(p.hp)} · ${p.gm.toLowerCase()}`;
+  }
+}
+
+function addLog(e, flash) {
+  logs.unshift(e); if (logs.length > 80) logs.pop();
+  if (flash) renderLog();
+}
+function renderLog() {
+  const box = $('log'); box.replaceChildren();
+  for (const e of logs) {
+    const verb = e.type === 'place' ? 'platziert' : e.type === 'break' ? 'abgebaut' : 'Explosion';
+    const row = el('div', 'row ' + e.type, `${e.p} · ${verb}: ${e.b}`);
+    row.append(el('small', '', `${new Date(e.t).toLocaleTimeString()} · ${e.w} · ${e.x} ${e.y} ${e.z}`));
+    row.onclick = () => { world = e.w; $('worldSel').value = world; view.x = e.x; view.z = e.z; follow = null; };
+    box.append(row);
+  }
+}
+
+function onEvent(e) {
+  addLog(e, true);
+  flashes.push({...e, t: Date.now()});
+  setTimeout(() => markDirty(e.w, e.x, e.z, e.type === 'explode' ? 1 : 0), 500);
+}
+
+function updateWorlds() {
+  const sel = $('worldSel'), names = state.worlds.map(w => w.name).join(',');
+  if (sel.dataset.names !== names) {
+    sel.dataset.names = names; sel.replaceChildren();
+    for (const w of state.worlds) { const o = el('option', '', `${w.name} (${w.env.toLowerCase()})`); o.value = w.name; sel.append(o); }
+    sel.value = world;
+  }
+  const wd = state.worlds.find(w => w.name === world);
+  const mobs = state.mobs.filter(m => m.w === world);
+  const h = mobs.filter(m => m.h).length, hh = Math.floor((wd ? wd.time / 1000 + 6 : 0) % 24), mm = Math.floor(((wd ? wd.time : 0) % 1000) / 1000 * 60);
+  $('info').textContent = wd ? `· ${chunkMode() ? 'Detail' : 'Übersicht'} · TPS ${state.tps} · ${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}${wd.storm ? ' ⛈' : ''} · Chunks ${wd.chunks} · Mobs ${mobs.length} (${h} feindlich)` : '';
+}
+
+// ---------- Polling ----------
+async function poll() {
+  try {
+    const [st, ev] = await Promise.all([api('/api/state'), api('/api/events?since=' + lastEv)]);
+    state = st;
+    if (first) {
+      const p = st.players[0];
+      world = p ? p.w : st.worlds[0]?.name;
+      const wd = st.worlds.find(w => w.name === world);
+      view.x = p ? p.x : (wd ? wd.sx : 0); view.z = p ? p.z : (wd ? wd.sz : 0);
+      for (const e of ev.events.slice().reverse()) logs.push(e);
+      renderLog();
+      first = false;
+    } else {
+      for (const e of ev.events) onEvent(e);
+    }
+    lastEv = Math.max(lastEv, ev.last);
+    updateWorlds(); $('worldSel').value = world;
+    if (follow) {
+      const p = st.players.find(p => p.name === follow);
+      if (p) { if (p.w !== world) { world = p.w; $('worldSel').value = world; } if (!dragging) { view.x = p.x; view.z = p.z; } }
+    }
+    renderPlayers();
+    if (!mouse && !mode3d) $('status').textContent = 'Verbunden';
+    if (mode3d) fetch3d(); else fetchTiles();
+  } catch (e) {
+    $('status').textContent = 'Keine Verbindung zum Server…';
+  }
+  setTimeout(poll, 500);
+}
+
+// ================= 3D-ANSICHT (WebGL, Texturen aus der Minecraft-Jar) =================
+let mode3d = false, gl = null, prog = null, loc = {}, dynBuf = null, dynN = 0, lastDyn = 0, fetching3 = false, vp = null;
+let pv = {x: NaN, z: NaN}, drag3 = null;
+const cam = {yaw: 0.8, pitch: 0.7, dist: 70, tx: 0, ty: 70, tz: 0};
+const cd = new Map(), meshes = new Map(), meshQ = new Set(), tried3 = new Map();
+const glc = $('gl'), ovc = $('ov'), octx = ovc.getContext('2d');
+const atlas = {ready: false, loading: false, noPack: false, info: null, cols: 64, rows: 1, tex: null};
+
+function persp(fovy, asp, n, f) {
+  const t = 1 / Math.tan(fovy / 2);
+  return new Float32Array([t / asp, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0]);
+}
+function lookAt(e, c, u) {
+  let zx = e[0] - c[0], zy = e[1] - c[1], zz = e[2] - c[2], l = Math.hypot(zx, zy, zz);
+  zx /= l; zy /= l; zz /= l;
+  let xx = u[1] * zz - u[2] * zy, xy = u[2] * zx - u[0] * zz, xz = u[0] * zy - u[1] * zx;
+  l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+  const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+  return new Float32Array([xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(xx * e[0] + xy * e[1] + xz * e[2]), -(yx * e[0] + yy * e[1] + yz * e[2]), -(zx * e[0] + zy * e[1] + zz * e[2]), 1]);
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + j] * b[i * 4 + k];
+    o[i * 4 + j] = s;
+  }
+  return o;
+}
+
+// UV-Rechteck einer Kachel im Atlas (Kachel 0 = weiss)
+function tileUV(t) {
+  const W = atlas.cols * 16, H = atlas.rows * 16, cx = t % atlas.cols, cy = Math.floor(t / atlas.cols);
+  return [(cx * 16 + .25) / W, (cy * 16 + .25) / H, (cx * 16 + 15.75) / W, (cy * 16 + 15.75) / H];
+}
+
+// Vertex-Puffer: je Vertex 24 Bytes = 3 Float (Position) + 2 Float (UV) + 4 Byte (Farbe)
+function mk() {
+  let cap = 4096, buf = new ArrayBuffer(cap * 24), f32 = new Float32Array(buf), u8 = new Uint8Array(buf);
+  const o = {n: 0};
+  const grow = () => {
+    cap *= 2;
+    const nb = new ArrayBuffer(cap * 24);
+    new Uint8Array(nb).set(new Uint8Array(buf));
+    buf = nb; f32 = new Float32Array(buf); u8 = new Uint8Array(buf);
+  };
+  const v = (p, u, w, c, s) => {
+    if (o.n >= cap) grow();
+    const a = o.n * 6, b = o.n * 24 + 20;
+    f32[a] = p[0]; f32[a + 1] = p[1]; f32[a + 2] = p[2]; f32[a + 3] = u; f32[a + 4] = w;
+    u8[b] = c[0] * s; u8[b + 1] = c[1] * s; u8[b + 2] = c[2] * s; u8[b + 3] = 255;
+    o.n++;
+  };
+  o.qt = (p0, p1, p2, p3, tile, c, s) => {
+    const t = tileUV(tile);
+    v(p0, t[0], t[1], c, s); v(p1, t[2], t[1], c, s); v(p2, t[2], t[3], c, s);
+    v(p0, t[0], t[1], c, s); v(p2, t[2], t[3], c, s); v(p3, t[0], t[3], c, s);
+  };
+  o.q = (p0, p1, p2, p3, c, s) => o.qt(p0, p1, p2, p3, 0, c, s);
+  o.box = (x, y, z, w, h, d, c) => {
+    const x1 = x + w, y1 = y + h, z1 = z + d;
+    o.q([x, y1, z], [x1, y1, z], [x1, y1, z1], [x, y1, z1], c, 1);
+    o.q([x, y, z], [x1, y, z], [x1, y, z1], [x, y, z1], c, .5);
+    o.q([x, y, z], [x, y1, z], [x, y1, z1], [x, y, z1], c, .75);
+    o.q([x1, y, z], [x1, y1, z], [x1, y1, z1], [x1, y, z1], c, .75);
+    o.q([x, y, z], [x1, y, z], [x1, y1, z], [x, y1, z], c, .85);
+    o.q([x, y, z1], [x1, y, z1], [x1, y1, z1], [x, y1, z1], c, .65);
+  };
+  o.finish = () => buf.slice(0, o.n * 24);
+  return o;
+}
+
+// Hoehe der obersten Spalte: Zahl, null = leer (Void), undefined = Chunk fehlt
+function hAt(w, wx, wz) {
+  const cx = Math.floor(wx / 16), cz = Math.floor(wz / 16), d = cd.get(w + '|' + cx + '|' + cz);
+  if (!d) return undefined;
+  const i = (wz - cz * 16) * 16 + (wx - cx * 16);
+  return d.col[i] < 0 ? null : d.h[i];
+}
+
+const SIDES = [[-1, 0, .78], [1, 0, .78], [0, -1, .88], [0, 1, .66]];
+const WHITE = [255, 255, 255];
+function tileOf(id, side) {
+  if (!atlas.ready || !id) return 0;
+  return (side ? atlas.info.side[id] : atlas.info.top[id]) || 0;
+}
+function wallQuad(o, dx, wx, wz, yt, yb, tile, rgb, sh) {
+  if (dx) {
+    const px = dx < 0 ? wx : wx + 1;
+    o.qt([px, yt, wz], [px, yt, wz + 1], [px, yb, wz + 1], [px, yb, wz], tile, rgb, sh);
+  } else {
+    const pz = wz;   // wird unten ueber wz-Parameter richtig gesetzt
+    o.qt([wx, yt, pz], [wx + 1, yt, pz], [wx + 1, yb, pz], [wx, yb, pz], tile, rgb, sh);
+  }
+}
+
+function buildMesh(d) {
+  const o = mk(), X0 = d.cx * 16, Z0 = d.cz * 16;
+  for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) {
+    const i = z * 16 + x, col = d.col[i];
+    if (col < 0) continue;
+    const hh = d.h[i], y = hh + 1, wx = X0 + x, wz = Z0 + z;
+    const bi = d.b ? d.b[i] : 0, tid = bi & 65535, uid = (bi >>> 16) || tid;
+    const tt = tileOf(tid, false);
+    const rgb = tt ? WHITE : [(col >> 16) & 255, (col >> 8) & 255, col & 255];
+    const ts = tt ? (tileOf(tid, true) || tt) : 0, tu = tt ? (tileOf(uid, true) || ts) : 0;
+    o.qt([wx, y, wz], [wx + 1, y, wz], [wx + 1, y, wz + 1], [wx, y, wz + 1], tt, rgb, 1);
+    for (const [dx, dz, sh] of SIDES) {
+      const nx = x + dx, nz = z + dz;
+      let hn;
+      if (nx >= 0 && nx < 16 && nz >= 0 && nz < 16) { const j = nz * 16 + nx; hn = d.col[j] < 0 ? null : d.h[j]; }
+      else hn = hAt(d.w, wx + dx, wz + dz);
+      if (hn === undefined) continue;
+      if (hn === null) hn = hh - 4;
+      if (hn >= hh) continue;
+      const rows = hh - hn, n1 = Math.min(rows, 5);
+      const zz = dz < 0 ? wz : wz + 1;   // Ebene der Wand in Z-Richtung
+      for (let k = 0; k < n1; k++) wallQuad2(o, dx, wx, wz, zz, y - k, y - k - 1, k === 0 ? ts : tu, rgb, sh);
+      if (rows > n1) wallQuad2(o, dx, wx, wz, zz, y - n1, hn + 1, tu, rgb, sh);
+    }
+  }
+  return {buf: o.finish(), n: o.n};
+}
+function wallQuad2(o, dx, wx, wz, zz, yt, yb, tile, rgb, sh) {
+  if (dx) {
+    const px = dx < 0 ? wx : wx + 1;
+    o.qt([px, yt, wz], [px, yt, wz + 1], [px, yb, wz + 1], [px, yb, wz], tile, rgb, sh);
+  } else {
+    o.qt([wx, yt, zz], [wx + 1, yt, zz], [wx + 1, yb, zz], [wx, yb, zz], tile, rgb, sh);
+  }
+}
+
+function uploadMesh(d) {
+  const k = d.w + '|' + d.cx + '|' + d.cz, old = meshes.get(k);
+  if (old) gl.deleteBuffer(old.vb);
+  const m = buildMesh(d);
+  if (!m.n) { meshes.delete(k); return; }
+  const vb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, m.buf, gl.STATIC_DRAW);
+  meshes.set(k, {vb, n: m.n, w: d.w, cx: d.cx, cz: d.cz});
+}
+
+function initGL() {
+  if (gl) return true;
+  gl = glc.getContext('webgl', {antialias: true});
+  if (!gl) { alert('Dein Browser unterstützt WebGL nicht.'); return false; }
+  const vs = 'attribute vec3 p;attribute vec2 t;attribute vec4 c;uniform mat4 m;uniform float fe;' +
+             'varying vec2 vt;varying vec3 vc;varying float fg;' +
+             'void main(){gl_Position=m*vec4(p,1.0);vt=t;vc=c.rgb;fg=clamp(gl_Position.w/fe,0.0,1.0);}';
+  const fs = 'precision mediump float;uniform sampler2D tx;uniform vec3 fc;varying vec2 vt;varying vec3 vc;varying float fg;' +
+             'void main(){vec4 s=texture2D(tx,vt);gl_FragColor=vec4(mix(s.rgb*vc,fc,fg*fg),1.0);}';
+  const sh = (t, src) => { const x = gl.createShader(t); gl.shaderSource(x, src); gl.compileShader(x); if (!gl.getShaderParameter(x, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(x)); return x; };
+  prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(prog));
+  loc = {p: gl.getAttribLocation(prog, 'p'), t: gl.getAttribLocation(prog, 't'), c: gl.getAttribLocation(prog, 'c'),
+         m: gl.getUniformLocation(prog, 'm'), fe: gl.getUniformLocation(prog, 'fe'), fc: gl.getUniformLocation(prog, 'fc'),
+         tx: gl.getUniformLocation(prog, 'tx')};
+  dynBuf = gl.createBuffer();
+  atlas.tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, atlas.tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 255, 255, 255]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.enable(gl.DEPTH_TEST);
+  return true;
+}
+
+function bindAttrib(vb) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.enableVertexAttribArray(loc.p); gl.vertexAttribPointer(loc.p, 3, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(loc.t); gl.vertexAttribPointer(loc.t, 2, gl.FLOAT, false, 24, 12);
+  gl.enableVertexAttribArray(loc.c); gl.vertexAttribPointer(loc.c, 4, gl.UNSIGNED_BYTE, true, 24, 20);
+}
+
+// ---------- Textur-Atlas aus dem Paket des Servers ----------
+function makeTileImg(spec, bmp) {
+  const c = document.createElement('canvas'); c.width = c.height = 16;
+  const g = c.getContext('2d'); g.imageSmoothingEnabled = false;
+  if (!spec || spec[0] === '#') { g.fillStyle = spec || '#fff'; g.fillRect(0, 0, 16, 16); return c; }
+  const [main, tint] = spec.split('@'), [base, ov] = main.split('+');
+  const layer = (name, tintHex) => {
+    const b = bmp[name]; if (!b) return null;
+    const l = document.createElement('canvas'); l.width = l.height = 16;
+    const lg = l.getContext('2d'); lg.imageSmoothingEnabled = false;
+    const s = Math.min(b.width, b.height);   // animierte Texturen: erstes Bild
+    lg.drawImage(b, 0, 0, s, s, 0, 0, 16, 16);
+    if (tintHex) {
+      lg.globalCompositeOperation = 'multiply'; lg.fillStyle = '#' + tintHex; lg.fillRect(0, 0, 16, 16);
+      lg.globalCompositeOperation = 'destination-in'; lg.drawImage(b, 0, 0, s, s, 0, 0, 16, 16);
+    }
+    return l;
+  };
+  const bl = layer(base, ov ? null : tint);
+  if (!bl) { g.fillStyle = '#ff00ff'; g.fillRect(0, 0, 16, 16); return c; }
+  // durchsichtige Stellen (Laub, Glas ...) mit der Durchschnittsfarbe fuellen
+  const px = bl.getContext('2d').getImageData(0, 0, 16, 16).data;
+  let r = 0, gg = 0, bb = 0, n = 0;
+  for (let i = 0; i < px.length; i += 4) if (px[i + 3] > 16) { r += px[i]; gg += px[i + 1]; bb += px[i + 2]; n++; }
+  if (n) { g.fillStyle = `rgb(${(r / n * .6) | 0},${(gg / n * .6) | 0},${(bb / n * .6) | 0})`; g.fillRect(0, 0, 16, 16); }
+  g.drawImage(bl, 0, 0);
+  if (ov) { const ol = layer(ov, tint); if (ol) g.drawImage(ol, 0, 0); }
+  return c;
+}
+
+async function loadAtlas() {
+  if (atlas.loading || atlas.ready) return;
+  atlas.loading = true;
+  try {
+    const info = await api('/api/blocks');
+    const r = await fetch('/api/texpack?token=' + encodeURIComponent(TOKEN));
+    if (!r.ok) { atlas.noPack = true; return; }
+    const dv = new DataView(await r.arrayBuffer()), u8 = new Uint8Array(dv.buffer), dec = new TextDecoder();
+    const bmp = {}, jobs = [];
+    let p = 0;
+    while (p < dv.byteLength) {
+      const nl = dv.getUint8(p); p += 1;
+      const name = dec.decode(u8.subarray(p, p + nl)); p += nl;
+      const len = dv.getUint32(p); p += 4;
+      const bytes = u8.slice(p, p + len); p += len;
+      jobs.push(createImageBitmap(new Blob([bytes], {type: 'image/png'})).then(b => { bmp[name] = b; }).catch(() => {}));
+    }
+    await Promise.all(jobs);
+    const n = info.tiles.length, cols = 64, rows = Math.ceil(n / cols);
+    const cvs = document.createElement('canvas'); cvs.width = cols * 16; cvs.height = rows * 16;
+    const g = cvs.getContext('2d'); g.imageSmoothingEnabled = false;
+    for (let i = 0; i < n; i++) g.drawImage(makeTileImg(info.tiles[i], bmp), (i % cols) * 16, Math.floor(i / cols) * 16);
+    gl.bindTexture(gl.TEXTURE_2D, atlas.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cvs);
+    atlas.info = info; atlas.cols = cols; atlas.rows = rows; atlas.ready = true;
+    for (const k of cd.keys()) meshQ.add(k);   // alle Meshes mit Texturen neu bauen
+  } catch (e) { console.error(e); }
+  atlas.loading = false;
+  if (atlas.noPack && mode3d) $('status').textContent = '3D ohne Texturen: Lege die Minecraft-Jar (1.21.11.jar) in plugins/LiveMap/ auf dem Server ab und starte neu.';
+}
+
+// Spieler, Mobs und Block-Ereignisse als bewegliche Quader
+function buildDyn() {
+  if (!state) return;
+  const items = [], now = Date.now();
+  for (const m of state.mobs) {
+    if (m.w !== world || (m.h ? !$('tHo').checked : !$('tPa').checked)) continue;
+    items.push([m.x - .35, m.y, m.z - .35, .7, 1, .7, m.h ? [255, 70, 70] : [90, 220, 90]]);
+  }
+  if ($('tPl').checked) for (const p of state.players) {
+    if (p.w !== world) continue;
+    items.push([p.x - .4, p.y, p.z - .4, .8, 1.8, .8, [77, 225, 255]]);
+    items.push([p.x - .1, p.y + 1.8, p.z - .1, .2, 40, .2, [77, 225, 255]]);
+  }
+  for (const f of flashes) {
+    const age = now - f.t;
+    if (age > 4000 || f.w !== world) continue;
+    const c = f.type === 'place' ? [111, 220, 111] : f.type === 'break' ? [255, 107, 107] : [255, 179, 71];
+    items.push([f.x + .3, f.y, f.z + .3, .4, 30 * (1 - age / 4000) + 2, .4, c]);
+  }
+  const o = mk();
+  for (const [x, y, z, w, h, d, c] of items) o.box(x, y, z, w, h, d, c);
+  dynN = o.n;
+  if (!dynN) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, dynBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, o.finish(), gl.DYNAMIC_DRAW);
+}
+
+function proj(x, y, z, W, H) {
+  const m = vp, cx = m[0] * x + m[4] * y + m[8] * z + m[12], cy = m[1] * x + m[5] * y + m[9] * z + m[13],
+        cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+  if (cw <= 0) return null;
+  return [(cx / cw * .5 + .5) * W, (1 - (cy / cw * .5 + .5)) * H];
+}
+
+function drawLabels(W, H) {
+  octx.clearRect(0, 0, W, H);
+  if (!state || !$('tPl').checked) return;
+  octx.font = 'bold 13px sans-serif'; octx.textAlign = 'center'; octx.lineWidth = 3;
+  for (const p of state.players) {
+    if (p.w !== world) continue;
+    const s = proj(p.x, p.y + 2.4, p.z, W, H);
+    if (!s) continue;
+    octx.strokeStyle = '#000'; octx.strokeText(p.name, s[0], s[1]);
+    octx.fillStyle = '#fff'; octx.fillText(p.name, s[0], s[1]);
+  }
+}
+
+function draw3d() {
+  const W = glc.clientWidth, H = glc.clientHeight;
+  if (!W || !H) return;
+  if (glc.width !== W || glc.height !== H) { glc.width = ovc.width = W; glc.height = ovc.height = H; }
+  gl.viewport(0, 0, W, H);
+  const env = state && state.worlds.find(w => w.name === world)?.env;
+  const fc = env === 'NETHER' ? [.25, .08, .06] : env === 'THE_END' ? [.1, .08, .15] : [.55, .72, .9];
+  gl.clearColor(fc[0], fc[1], fc[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+  if (view.x !== pv.x || view.z !== pv.z) { cam.tx = view.x; cam.tz = view.z; pv = {x: view.x, z: view.z}; }
+  if (follow && state) {
+    const p = state.players.find(p => p.name === follow);
+    if (p && p.w === world) { cam.tx = p.x; cam.ty = p.y; cam.tz = p.z; }
+  } else {
+    const gh = hAt(world, Math.floor(cam.tx), Math.floor(cam.tz));
+    if (typeof gh === 'number') cam.ty += (gh + 1 - cam.ty) * 0.1;
+  }
+
+  let budget = 6;
+  for (const k of meshQ) {
+    meshQ.delete(k);
+    const d = cd.get(k);
+    if (d) uploadMesh(d);
+    if (--budget <= 0) break;
+  }
+
+  const R = +$('r3').value, fe = (R + 1) * 16 * 1.2, cp = Math.cos(cam.pitch);
+  const eye = [cam.tx + cam.dist * cp * Math.sin(cam.yaw), cam.ty + cam.dist * Math.sin(cam.pitch), cam.tz + cam.dist * cp * Math.cos(cam.yaw)];
+  vp = mul(persp(Math.PI / 3, W / H, 0.5, fe * 1.5), lookAt(eye, [cam.tx, cam.ty, cam.tz], [0, 1, 0]));
+  gl.useProgram(prog);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, atlas.tex); gl.uniform1i(loc.tx, 0);
+  gl.uniformMatrix4fv(loc.m, false, vp); gl.uniform1f(loc.fe, fe); gl.uniform3fv(loc.fc, fc);
+  for (const m of meshes.values()) {
+    if (m.w !== world) continue;
+    bindAttrib(m.vb); gl.drawArrays(gl.TRIANGLES, 0, m.n);
+  }
+  const now = Date.now();
+  if (now - lastDyn > 250) { buildDyn(); lastDyn = now; }
+  if (dynN) { bindAttrib(dynBuf); gl.drawArrays(gl.TRIANGLES, 0, dynN); }
+  drawLabels(W, H);
+}
+
+async function fetch3d() {
+  if (!world || !state || fetching3) return;
+  fetching3 = true;
+  try {
+    const R = +$('r3').value, wname = world, now = Date.now();
+    const mx = Math.floor(cam.tx / 16), mz = Math.floor(cam.tz / 16);
+    const pls = state.players.filter(p => p.w === wname);
+    const near = (cx, cz) => pls.some(p => Math.abs(Math.floor(p.x / 16) - cx) <= 3 && Math.abs(Math.floor(p.z / 16) - cz) <= 3);
+    const groups = new Map();
+    for (let cx = mx - R; cx <= mx + R; cx++) for (let cz = mz - R; cz <= mz + R; cz++) {
+      const k = wname + '|' + cx + '|' + cz, d = cd.get(k);
+      const need = d ? (d.dirty || now - d.t > 60000 || (near(cx, cz) && now - d.t > 4000)) : (now - (tried3.get(k) || 0) > 10000);
+      if (!need) continue;
+      const gk = Math.floor(cx / 8) + ',' + Math.floor(cz / 8);
+      if (!groups.has(gk)) groups.set(gk, [Math.floor(cx / 8) * 8, Math.floor(cz / 8) * 8]);
+    }
+    for (const [gx, gz] of [...groups.values()].slice(0, 3)) {
+      const r = await api(`/api/chunks?world=${encodeURIComponent(wname)}&x0=${gx}&z0=${gz}&x1=${gx + 7}&z1=${gz + 7}&h=1`);
+      for (const c of r.chunks) {
+        if (!c.h) continue;
+        const k = wname + '|' + c.x + '|' + c.z, isNew = !cd.has(k);
+        cd.set(k, {w: wname, cx: c.x, cz: c.z, col: c.d, h: c.h, b: c.b || null, t: Date.now(), dirty: false});
+        meshQ.add(k);
+        if (isNew) for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nk = wname + '|' + (c.x + dx) + '|' + (c.z + dz);
+          if (cd.has(nk)) meshQ.add(nk);
+        }
+      }
+      for (let cx = gx; cx < gx + 8; cx++) for (let cz = gz; cz < gz + 8; cz++) {
+        const k = wname + '|' + cx + '|' + cz;
+        tried3.set(k, Date.now());
+        const d = cd.get(k); if (d) d.dirty = false;
+      }
+    }
+    for (const [k, m] of meshes) {
+      if (m.w !== wname || Math.abs(m.cx - mx) > R + 2 || Math.abs(m.cz - mz) > R + 2) { gl.deleteBuffer(m.vb); meshes.delete(k); }
+    }
+    for (const [k, d] of cd) {
+      if (d.w !== wname || Math.abs(d.cx - mx) > R + 3 || Math.abs(d.cz - mz) > R + 3) cd.delete(k);
+    }
+  } catch (e) { /* naechster Versuch */ }
+  fetching3 = false;
+}
+
+// Steuerung: ziehen = drehen, Shift/Rechtsklick = verschieben, Mausrad = Zoom
+glc.addEventListener('contextmenu', e => e.preventDefault());
+glc.addEventListener('pointerdown', e => { drag3 = {x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey}; glc.setPointerCapture(e.pointerId); });
+glc.addEventListener('pointerup', () => { drag3 = null; });
+glc.addEventListener('pointermove', e => {
+  if (!drag3) return;
+  const dx = e.clientX - drag3.x, dy = e.clientY - drag3.y;
+  drag3.x = e.clientX; drag3.y = e.clientY;
+  if (drag3.pan) {
+    follow = null;
+    const k = cam.dist * 0.002, s = Math.sin(cam.yaw), c = Math.cos(cam.yaw);
+    cam.tx += -c * dx * k - s * dy * k;
+    cam.tz += s * dx * k - c * dy * k;
+  } else {
+    cam.yaw -= dx * 0.005;
+    cam.pitch = Math.min(1.5, Math.max(0.05, cam.pitch + dy * 0.005));
+  }
+});
+glc.addEventListener('wheel', e => {
+  e.preventDefault();
+  cam.dist = Math.min((+$('r3').value + 1) * 16, Math.max(8, cam.dist * Math.exp(e.deltaY * 0.001)));
+}, {passive: false});
+
+$('b3d').onclick = () => {
+  const want = !mode3d;
+  if (want && !initGL()) return;
+  mode3d = want;
+  cv.style.display = mode3d ? 'none' : 'block';
+  glc.style.display = ovc.style.display = mode3d ? 'block' : 'none';
+  $('o3').style.display = mode3d ? '' : 'none';
+  $('tGrid').parentElement.style.display = mode3d ? 'none' : '';
+  $('b3d').textContent = mode3d ? '2D-Ansicht' : '3D-Ansicht';
+  if (mode3d) {
+    cam.tx = view.x; cam.tz = view.z; pv = {x: view.x, z: view.z};
+    $('status').textContent = atlas.noPack ? 'Ziehen: drehen · Shift/Rechtsklick: verschieben · Mausrad: Zoom (ohne Texturen)'
+                                           : 'Ziehen: drehen · Shift/Rechtsklick: verschieben · Mausrad: Zoom';
+    loadAtlas();
+  } else {
+    view.x = cam.tx; view.z = cam.tz;
+    $('status').textContent = 'Verbunden';
+  }
+};
+
+poll();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
